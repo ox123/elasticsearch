@@ -28,7 +28,6 @@ import org.elasticsearch.index.MockEngineFactoryPlugin;
 import org.elasticsearch.index.engine.EngineFactory;
 import org.elasticsearch.index.mapper.SeqNoFieldMapper;
 import org.elasticsearch.index.query.QueryBuilders;
-import org.elasticsearch.node.Node;
 import org.elasticsearch.plugins.EnginePlugin;
 import org.elasticsearch.plugins.Plugin;
 import org.elasticsearch.plugins.RepositoryPlugin;
@@ -48,13 +47,13 @@ import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
-import java.util.concurrent.ExecutionException;
-import java.util.function.Consumer;
+import java.util.function.BiConsumer;
 
 import static org.elasticsearch.common.xcontent.XContentFactory.jsonBuilder;
 import static org.elasticsearch.test.hamcrest.ElasticsearchAssertions.assertAcked;
 import static org.elasticsearch.test.hamcrest.ElasticsearchAssertions.assertHitCount;
 
+@ESIntegTestCase.ClusterScope(numDataNodes = 0)
 public class SourceOnlySnapshotIT extends ESIntegTestCase {
 
     @Override
@@ -97,7 +96,10 @@ public class SourceOnlySnapshotIT extends ESIntegTestCase {
         boolean requireRouting = randomBoolean();
         boolean useNested = randomBoolean();
         IndexRequestBuilder[] builders = snashotAndRestore(sourceIdx, 1, true, requireRouting, useNested);
-        assertHits(sourceIdx, builders.length);
+        IndicesStatsResponse indicesStatsResponse = client().admin().indices().prepareStats(sourceIdx).clear().setDocs(true).get();
+        long deleted = indicesStatsResponse.getTotal().docs.getDeleted();
+        boolean sourceHadDeletions = deleted > 0; // we use indexRandom which might create holes ie. deleted docs
+        assertHits(sourceIdx, builders.length, sourceHadDeletions);
         assertMappings(sourceIdx, requireRouting, useNested);
         SearchPhaseExecutionException e = expectThrows(SearchPhaseExecutionException.class, () -> {
             client().prepareSearch(sourceIdx).setQuery(QueryBuilders.idsQuery()
@@ -116,7 +118,7 @@ public class SourceOnlySnapshotIT extends ESIntegTestCase {
             client().admin().indices().prepareUpdateSettings(sourceIdx)
                 .setSettings(Settings.builder().put("index.number_of_replicas", 1)).get();
         ensureGreen(sourceIdx);
-        assertHits(sourceIdx, builders.length);
+        assertHits(sourceIdx, builders.length, sourceHadDeletions);
     }
 
     public void testSnapshotAndRestoreWithNested() throws Exception {
@@ -125,7 +127,7 @@ public class SourceOnlySnapshotIT extends ESIntegTestCase {
         IndexRequestBuilder[] builders = snashotAndRestore(sourceIdx, 1, true, requireRouting, true);
         IndicesStatsResponse indicesStatsResponse = client().admin().indices().prepareStats().clear().setDocs(true).get();
         assertThat(indicesStatsResponse.getTotal().docs.getDeleted(), Matchers.greaterThan(0L));
-        assertHits(sourceIdx, builders.length);
+        assertHits(sourceIdx, builders.length, true);
         assertMappings(sourceIdx, requireRouting, true);
         SearchPhaseExecutionException e = expectThrows(SearchPhaseExecutionException.class, () ->
             client().prepareSearch(sourceIdx).setQuery(QueryBuilders.idsQuery().addIds("" + randomIntBetween(0, builders.length))).get());
@@ -141,7 +143,7 @@ public class SourceOnlySnapshotIT extends ESIntegTestCase {
         client().admin().indices().prepareUpdateSettings(sourceIdx).setSettings(Settings.builder().put("index.number_of_replicas", 1))
             .get();
         ensureGreen(sourceIdx);
-        assertHits(sourceIdx, builders.length);
+        assertHits(sourceIdx, builders.length, true);
     }
 
     private void assertMappings(String sourceIdx, boolean requireRouting, boolean useNested) throws IOException {
@@ -165,15 +167,12 @@ public class SourceOnlySnapshotIT extends ESIntegTestCase {
         }
     }
 
-    private void assertHits(String index, int numDocsExpected) {
+    private void assertHits(String index, int numDocsExpected, boolean sourceHadDeletions) {
         SearchResponse searchResponse = client().prepareSearch(index)
             .addSort(SeqNoFieldMapper.NAME, SortOrder.ASC)
             .setSize(numDocsExpected).get();
-        Consumer<SearchResponse> assertConsumer = res -> {
+        BiConsumer<SearchResponse, Boolean> assertConsumer = (res, allowHoles) -> {
             SearchHits hits = res.getHits();
-            IndicesStatsResponse indicesStatsResponse = client().admin().indices().prepareStats().clear().setDocs(true).get();
-            long deleted = indicesStatsResponse.getTotal().docs.getDeleted();
-            boolean allowHoles = deleted > 0; // we use indexRandom which might create holes ie. deleted docs
             long i = 0;
             for (SearchHit hit : hits) {
                 String id = hit.getId();
@@ -190,24 +189,31 @@ public class SourceOnlySnapshotIT extends ESIntegTestCase {
                 assertEquals("r" + id, hit.field("_routing").getValue());
             }
         };
-        assertConsumer.accept(searchResponse);
-        assertEquals(numDocsExpected, searchResponse.getHits().totalHits);
+        assertConsumer.accept(searchResponse, sourceHadDeletions);
+        assertEquals(numDocsExpected, searchResponse.getHits().getTotalHits().value);
         searchResponse = client().prepareSearch(index)
             .addSort(SeqNoFieldMapper.NAME, SortOrder.ASC)
             .setScroll("1m")
             .slice(new SliceBuilder(SeqNoFieldMapper.NAME, randomIntBetween(0,1), 2))
             .setSize(randomIntBetween(1, 10)).get();
-        do {
-            // now do a scroll with a slice
-            assertConsumer.accept(searchResponse);
-            searchResponse = client().prepareSearchScroll(searchResponse.getScrollId()).setScroll(TimeValue.timeValueMinutes(1)).get();
-        } while (searchResponse.getHits().getHits().length > 0);
-
+        try {
+            do {
+                // now do a scroll with a slice
+                assertConsumer.accept(searchResponse, true);
+                searchResponse = client().prepareSearchScroll(searchResponse.getScrollId()).setScroll(TimeValue.timeValueMinutes(1)).get();
+            } while (searchResponse.getHits().getHits().length > 0);
+        } finally {
+            if (searchResponse.getScrollId() != null) {
+                client().prepareClearScroll().addScrollId(searchResponse.getScrollId()).get();
+            }
+        }
     }
 
-    private IndexRequestBuilder[] snashotAndRestore(String sourceIdx, int numShards, boolean minimal, boolean requireRouting, boolean
-        useNested)
-        throws ExecutionException, InterruptedException, IOException {
+    private IndexRequestBuilder[] snashotAndRestore(final String sourceIdx,
+                                                    final int numShards,
+                                                    final boolean minimal,
+                                                    final boolean requireRouting,
+                                                    final boolean useNested) throws InterruptedException, IOException {
         logger.info("-->  starting a master node and a data node");
         internalCluster().startMasterOnlyNode();
         internalCluster().startDataOnlyNode();
@@ -271,12 +277,8 @@ public class SourceOnlySnapshotIT extends ESIntegTestCase {
         internalCluster().stopRandomDataNode();
         client().admin().cluster().prepareHealth().setTimeout("30s").setWaitForNodes("1");
 
-        logger.info("--> start a new data node");
-        final Settings dataSettings = Settings.builder()
-            .put(Node.NODE_NAME_SETTING.getKey(), randomAlphaOfLength(5))
-            .put(Environment.PATH_HOME_SETTING.getKey(), createTempDir()) // to get a new node id
-            .build();
-        internalCluster().startDataOnlyNode(dataSettings);
+        final String newDataNode = internalCluster().startDataOnlyNode();
+        logger.info("--> start a new data node " + newDataNode);
         client().admin().cluster().prepareHealth().setTimeout("30s").setWaitForNodes("2");
 
         logger.info("--> restore the index and ensure all shards are allocated");

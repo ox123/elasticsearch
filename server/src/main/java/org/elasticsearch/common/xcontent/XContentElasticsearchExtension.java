@@ -22,9 +22,9 @@ package org.elasticsearch.common.xcontent;
 import org.apache.lucene.util.BytesRef;
 import org.elasticsearch.common.bytes.BytesReference;
 import org.elasticsearch.common.time.DateFormatter;
-import org.elasticsearch.common.time.DateFormatters;
 import org.elasticsearch.common.unit.ByteSizeValue;
 import org.elasticsearch.common.unit.TimeValue;
+import org.elasticsearch.script.JodaCompatibleZonedDateTime;
 import org.joda.time.DateTime;
 import org.joda.time.DateTimeZone;
 import org.joda.time.Instant;
@@ -64,9 +64,9 @@ import java.util.function.Function;
 public class XContentElasticsearchExtension implements XContentBuilderExtension {
 
     public static final DateTimeFormatter DEFAULT_DATE_PRINTER = ISODateTimeFormat.dateTime().withZone(DateTimeZone.UTC);
-    public static final DateFormatter DEFAULT_FORMATTER = DateFormatters.forPattern("strict_date_optional_time_nanos");
-    public static final DateFormatter LOCAL_TIME_FORMATTER = DateFormatters.forPattern("HH:mm:ss.SSS");
-    public static final DateFormatter OFFSET_TIME_FORMATTER = DateFormatters.forPattern("HH:mm:ss.SSSZZZZZ");
+    public static final DateFormatter DEFAULT_FORMATTER = DateFormatter.forPattern("strict_date_optional_time_nanos");
+    public static final DateFormatter LOCAL_TIME_FORMATTER = DateFormatter.forPattern("HH:mm:ss.SSS");
+    public static final DateFormatter OFFSET_TIME_FORMATTER = DateFormatter.forPattern("HH:mm:ss.SSSZZZZZ");
 
     @Override
     public Map<Class<?>, XContentBuilder.Writer> getXContentWriters() {
@@ -93,6 +93,7 @@ public class XContentElasticsearchExtension implements XContentBuilderExtension 
         writers.put(Year.class, (b, v) -> b.value(v.toString()));
         writers.put(Duration.class, (b, v) -> b.value(v.toString()));
         writers.put(Period.class, (b, v) -> b.value(v.toString()));
+        writers.put(JodaCompatibleZonedDateTime.class, XContentBuilder::timeValue);
 
         writers.put(BytesReference.class, (b, v) -> {
             if (v == null) {
@@ -141,6 +142,8 @@ public class XContentElasticsearchExtension implements XContentBuilderExtension 
             d -> DEFAULT_FORMATTER.format(ZonedDateTime.ofInstant((java.time.Instant) d, ZoneOffset.UTC)));
         transformers.put(LocalDate.class, d -> ((LocalDate) d).toString());
         transformers.put(LocalTime.class, d -> LOCAL_TIME_FORMATTER.format((LocalTime) d));
+        transformers.put(JodaCompatibleZonedDateTime.class,
+            d -> DEFAULT_FORMATTER.format(((JodaCompatibleZonedDateTime) d).getZonedDateTime()));
         return transformers;
     }
 }
